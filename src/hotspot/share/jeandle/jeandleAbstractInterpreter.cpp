@@ -518,7 +518,7 @@ void JeandleAbstractInterpreter::initialize_VM_state() {
   int locals_idx = 0; // next index in locals
   int arg_idx = 0;  // next index in arguments
 
-  // Store the reciever into locals.
+  // Store the receiver into locals.
   if (!_method->is_static()) {
     initial_jvm->store(BasicType::T_OBJECT, 0, _llvm_func->getArg(0));
     locals_idx = 1;
@@ -1094,19 +1094,19 @@ void JeandleAbstractInterpreter::invoke() {
   }
 
   // Construct arguments.
-  const int reciever =
+  const int receiver =
     bc == Bytecodes::_invokespecial   ||
     bc == Bytecodes::_invokevirtual   ||
     bc == Bytecodes::_invokeinterface;
-  const int arg_size = declared_signature->count() + reciever;
+  const int arg_size = declared_signature->count() + receiver;
   llvm::SmallVector<llvm::Value*> args(arg_size);
   llvm::SmallVector<llvm::Type*> args_type(arg_size);
   for (int i = declared_signature->count() - 1; i >= 0; --i) {
     BasicType type = declared_signature->type_at(i)->basic_type();
-    args[i + reciever] = _jvm->pop(type);
-    args_type[i + reciever] = JeandleType::java2llvm(type, *_context);
+    args[i + receiver] = _jvm->pop(type);
+    args_type[i + receiver] = JeandleType::java2llvm(type, *_context);
   }
-  if (reciever) {
+  if (receiver) {
     args[0] = _jvm->pop(BasicType::T_OBJECT);
     args_type[0] = JeandleType::java2llvm(BasicType::T_OBJECT, *_context);
   }
@@ -1137,7 +1137,7 @@ void JeandleAbstractInterpreter::invoke() {
   func->setCallingConv(llvm::CallingConv::Hotspot_JIT);
   func->setGC(llvm::jeandle::JeandleGC);
 
-  // Decide call type and detination.
+  // Decide call type and destination.
   JeandleCompiledCall::Type call_type = JeandleCompiledCall::NOT_A_CALL;
   address dest = nullptr;
   switch (bc) {
