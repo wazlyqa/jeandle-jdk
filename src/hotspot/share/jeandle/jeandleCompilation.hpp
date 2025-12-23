@@ -75,12 +75,15 @@ class JeandleCompilation : public StackObj {
 
   Arena* arena() { return _arena; }
 
+  const std::string name() { return _name; }
+
  private:
   Arena* _arena; // Hold compilation life-time objects (JeandleCompilationResourceObj).
   llvm::TargetMachine* _target_machine;
   llvm::DataLayout* _data_layout;
   ciEnv* _env;
   ciMethod* _method;
+  const std::string _name;
   int _entry_bci;
   std::unique_ptr<llvm::LLVMContext> _context;
   std::unique_ptr<llvm::Module> _llvm_module;
@@ -99,5 +102,49 @@ class JeandleCompilation : public StackObj {
   void dump_obj();
   void dump_ir(bool optimized);
 };
+
+
+#ifdef ASSERT
+#define JEANDLE_CRASH_ON_ERROR(_error_msg)                            \
+do {                                                                  \
+  if (JeandleCrashOnError) {                                          \
+    fatal("Compilation failed in '%s': %s", JeandleCompilation::current()->name().c_str(), _error_msg); \
+  }                                                                   \
+} while (0)
+#else
+#define JEANDLE_CRASH_ON_ERROR(_error_msg) (void)(0)
+#endif
+
+#define JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(p, msg)             \
+do {                                                                  \
+  if (!(p)) {                                                         \
+    JeandleCompilation::report_jeandle_error(msg);                    \
+    JEANDLE_CRASH_ON_ERROR(msg);                                      \
+    return;                                                           \
+  }                                                                   \
+} while (0)
+
+#define JEANDLE_ERROR_ASSERT_AND_RET_ON_FAIL(p, msg, return_val)      \
+do {                                                                  \
+  if (!(p)) {                                                         \
+    JeandleCompilation::report_jeandle_error(msg);                    \
+    JEANDLE_CRASH_ON_ERROR(msg);                                      \
+    return return_val;                                                \
+  }                                                                   \
+} while (0)
+
+#define RETURN_VOID_ON_JEANDLE_ERROR()                                \
+do {                                                                  \
+  if (JeandleCompilation::jeandle_error_occurred()) {                 \
+    return;                                                           \
+  }                                                                   \
+} while (0)
+
+#define RETURN_ON_JEANDLE_ERROR(return_val)                           \
+do {                                                                  \
+  if (JeandleCompilation::jeandle_error_occurred()) {                 \
+    return return_val;                                                \
+  }                                                                   \
+} while (0)
 
 #endif // SHARE_JEANDLE_COMPILATION_HPP
