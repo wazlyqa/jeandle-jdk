@@ -47,7 +47,13 @@
 @oopDesc.klass_offset_in_bytes = external global i32
 
 ; Keep use to lately-used java operations, until it is lowered.
-@llvm.used = appending addrspace(1) global [1 x ptr] [ptr @jeandle.card_table_barrier], section "llvm.metadata"
+@llvm.used = appending addrspace(1) global [5 x ptr] [
+  ptr @jeandle.card_table_barrier,
+  ptr @jeandle.g1_pre_barrier,
+  ptr @jeandle.g1_post_barrier,
+  ptr @jeandle.pre_barrier,
+  ptr @jeandle.post_barrier
+], section "llvm.metadata"
 
 ; Load klass pointer from oop
 define hotspotcc ptr addrspace(0) @jeandle.load_klass(ptr addrspace(1) nocapture %oop) noinline "lower-phase"="0" {
@@ -181,6 +187,18 @@ entry:
 
 ; Declaration of Java card table barrier.
 declare hotspotcc void @jeandle.card_table_barrier(ptr addrspace(1) %addr) noinline "lower-phase"="1";
+
+; Declaration of Java g1 pre barrier.
+declare hotspotcc void @jeandle.g1_pre_barrier(ptr addrspace(1) %addr) noinline "lower-phase"="1";
+
+; Declaration of Java g1 post barrier.
+declare hotspotcc void @jeandle.g1_post_barrier(ptr addrspace(1) %addr, ptr addrspace(1) nocapture %oop) noinline "lower-phase"="1";
+
+; Declaration of Java pre barrier.
+declare hotspotcc void @jeandle.pre_barrier(ptr addrspace(1) %addr) noinline "lower-phase"="1";
+
+; Declaration of Java post barrier.
+declare hotspotcc void @jeandle.post_barrier(ptr addrspace(1) %addr, ptr addrspace(1) nocapture %oop) noinline "lower-phase"="1";
 
 ; Implementation of Java checkcast operation
 define hotspotcc i1 @jeandle.checkcast(ptr addrspace(0) nocapture %super_klass, ptr addrspace(1) nocapture %oop) noinline "lower-phase"="0" {

@@ -25,9 +25,13 @@
 #include "jeandle/templatemodule/jeandleRuntimeDefinedJavaOps.hpp"
 #include "jeandle/jeandleRuntimeRoutine.hpp"
 #include "jeandle/jeandleRegister.hpp"
+#include "jeandle/jeandleType.hpp"
 
 #include "jeandle/__hotspotHeadersBegin__.hpp"
 #include "ci/ciUtilities.hpp"
+#include "gc/g1/g1CardTable.hpp"
+#include "gc/g1/g1ThreadLocalData.hpp"
+#include "gc/g1/heapRegion.hpp"
 #include "gc/shared/cardTable.hpp"
 #include "gc/shared/gc_globals.hpp"
 #include "oops/arrayOop.hpp"
@@ -149,6 +153,262 @@ DEF_JAVA_OP(card_table_barrier, 1, llvm::Type::getVoidTy(context), llvm::Pointer
   ir_builder.CreateRetVoid();
 JAVA_OP_END
 
+DEF_JAVA_OP(g1_pre_barrier, 1, llvm::Type::getVoidTy(context), llvm::PointerType::get(context, llvm::jeandle::AddrSpace::JavaHeapAddrSpace))
+  // Get current thread pointer using jeandle.current_thread JavaOp
+  llvm::Function* current_thread_func = template_module.getFunction("jeandle.current_thread");
+  if (!current_thread_func) {
+    RuntimeDefinedJavaOps::set_failed("jeandle.current_thread is not found in template module");
+    return;
+  }
+  llvm::CallInst* current_thread = ir_builder.CreateCall(current_thread_func);
+  current_thread->setCallingConv(llvm::CallingConv::Hotspot_JIT);
+  llvm::Value* tls = current_thread;
+
+  llvm::Value* obj_addr = func->getArg(0);
+  llvm::Type* intptr_type = ir_builder.getIntPtrTy(template_module.getDataLayout());
+  llvm::Type* no_base = llvm::Type::getInt8Ty(context);
+
+  llvm::Type* marking_type = (in_bytes(SATBMarkQueue::byte_width_of_active()) == 4) ? ir_builder.getInt32Ty() : ir_builder.getInt8Ty();
+  assert(in_bytes(SATBMarkQueue::byte_width_of_active()) == 4 || in_bytes(SATBMarkQueue::byte_width_of_active()) == 1, "flag width");
+
+  // Offsets into the thread
+  llvm::Value* marking_offset = llvm::ConstantInt::get(intptr_type, in_bytes(G1ThreadLocalData::satb_mark_queue_active_offset()));
+  llvm::Value* index_offset   = llvm::ConstantInt::get(intptr_type, in_bytes(G1ThreadLocalData::satb_mark_queue_index_offset()));
+  llvm::Value* buffer_offset  = llvm::ConstantInt::get(intptr_type, in_bytes(G1ThreadLocalData::satb_mark_queue_buffer_offset()));
+
+  // Now the actual pointers into the thread
+  llvm::Value* marking_adr = ir_builder.CreateInBoundsGEP(no_base, tls, marking_offset);
+  llvm::Value* buffer_adr  = ir_builder.CreateInBoundsGEP(no_base, tls, buffer_offset);
+  llvm::Value* index_adr   = ir_builder.CreateInBoundsGEP(no_base, tls, index_offset);
+
+  // Now some of the values
+  llvm::Value* marking = ir_builder.CreateLoad(marking_type, marking_adr);
+
+  // if (!marking)
+  llvm::BasicBlock* pre_barrier_done     = llvm::BasicBlock::Create(context, "pre_barrier_done", func);
+  llvm::BasicBlock* store_original_value = llvm::BasicBlock::Create(context, "store_original_value", func);
+  llvm::Value* if_already_marked = ir_builder.CreateICmp(llvm::CmpInst::ICMP_EQ,
+                                                          marking,
+                                                          llvm::ConstantInt::get(marking_type, 0));
+  ir_builder.CreateCondBr(if_already_marked, pre_barrier_done, store_original_value);
+
+  ir_builder.SetInsertPoint(store_original_value);
+
+  llvm::Value* index = ir_builder.CreateLoad(intptr_type, index_adr);
+
+  // load original value
+  llvm::LoadInst* pre_val = ir_builder.CreateLoad(obj_addr->getType(), obj_addr);
+  pre_val->setAtomic(llvm::AtomicOrdering::Unordered);
+
+  // if (pre_val != nullptr)
+  llvm::BasicBlock* load_stab_queue = llvm::BasicBlock::Create(context, "load_stab_queue", func);
+  llvm::Value* pre_val_is_null = ir_builder.CreateIsNull(pre_val);
+  ir_builder.CreateCondBr(pre_val_is_null, pre_barrier_done, load_stab_queue);
+
+  ir_builder.SetInsertPoint(load_stab_queue);
+
+  llvm::Value* buffer = ir_builder.CreateIntToPtr(ir_builder.CreateLoad(intptr_type, buffer_adr),
+                                                  llvm::PointerType::get(context, llvm::jeandle::AddrSpace::CHeapAddrSpace));
+
+  // is the queue for this thread full?
+  llvm::BasicBlock* buffer_is_full  = llvm::BasicBlock::Create(context, "buffer_is_full", func);
+  llvm::BasicBlock* store_in_buffer = llvm::BasicBlock::Create(context, "store_in_buffer", func);
+  llvm::Value* index_is_zero = ir_builder.CreateICmp(llvm::CmpInst::ICMP_EQ,
+                                                      index,
+                                                      llvm::ConstantInt::get(intptr_type, 0));
+  ir_builder.CreateCondBr(index_is_zero, buffer_is_full, store_in_buffer);
+
+  ir_builder.SetInsertPoint(store_in_buffer);
+
+  // decrement the index
+  llvm::Value* next_index = ir_builder.CreateSub(index, llvm::ConstantInt::get(intptr_type, sizeof(intptr_t)));
+
+  // Now get the buffer location we will log the previous value into and store it
+  llvm::Value* log_addr = ir_builder.CreateInBoundsGEP(no_base, buffer, next_index);
+  llvm::StoreInst* store_value = ir_builder.CreateStore(pre_val, log_addr);
+  store_value->setAtomic(llvm::AtomicOrdering::Unordered);
+  // update the index
+  llvm::StoreInst* store_index = ir_builder.CreateStore(next_index, index_adr);
+  store_index->setAlignment(llvm::Align(8)); 
+  store_index->setAtomic(llvm::AtomicOrdering::Unordered);
+
+  ir_builder.CreateBr(pre_barrier_done);
+
+  ir_builder.SetInsertPoint(buffer_is_full);
+
+  // logging buffer is full, call the runtime
+  llvm::FunctionCallee prebarrier_callee = JeandleRuntimeRoutine::G1BarrierSetRuntime_write_ref_field_pre_entry_callee(template_module);
+  if (!prebarrier_callee) {
+    RuntimeDefinedJavaOps::set_failed("JeandleRuntimeRoutine::G1BarrierSetRuntime_write_ref_field_pre_entry_callee is not found");
+    return;
+  }
+  llvm::CallInst* call_inst = ir_builder.CreateCall(prebarrier_callee, {pre_val, tls});
+  call_inst->setCallingConv(llvm::CallingConv::C);
+
+  ir_builder.CreateBr(pre_barrier_done);
+  
+  ir_builder.SetInsertPoint(pre_barrier_done);
+
+  ir_builder.CreateRetVoid();
+JAVA_OP_END
+
+DEF_JAVA_OP(g1_post_barrier, 1, llvm::Type::getVoidTy(context),
+            llvm::PointerType::get(context, llvm::jeandle::AddrSpace::JavaHeapAddrSpace),
+            llvm::PointerType::get(context, llvm::jeandle::AddrSpace::JavaHeapAddrSpace))
+  llvm::Value* obj_addr = func->getArg(0);
+  llvm::Value* value = func->getArg(1);
+
+  assert(obj_addr != nullptr, "");
+
+  // Get current thread pointer using jeandle.current_thread JavaOp
+  llvm::Function* current_thread_func = template_module.getFunction("jeandle.current_thread");
+  if (!current_thread_func) {
+    RuntimeDefinedJavaOps::set_failed("jeandle.current_thread is not found in template module");
+    return;
+  }
+  llvm::CallInst* current_thread = ir_builder.CreateCall(current_thread_func);
+  current_thread->setCallingConv(llvm::CallingConv::Hotspot_JIT);
+  llvm::Value* tls = current_thread;
+  
+  llvm::Type* no_base = llvm::Type::getInt8Ty(context);
+  llvm::Type* intptr_type = ir_builder.getIntPtrTy(template_module.getDataLayout());
+  llvm::Value* young_card = llvm::ConstantInt::get(ir_builder.getInt8Ty(), (uint64_t)G1CardTable::g1_young_card_val());
+  llvm::Value* dirty_card = llvm::ConstantInt::get(ir_builder.getInt8Ty(), (uint64_t)G1CardTable::dirty_card_val());
+  llvm::Value* zeroX = llvm::ConstantInt::get(intptr_type, (uint64_t)0);
+  llvm::Value* zero = llvm::ConstantInt::get(ir_builder.getInt8Ty(), (uint64_t)0);
+  
+  // Offsets into the thread
+  llvm::Value* index_offset  = llvm::ConstantInt::get(intptr_type, in_bytes(G1ThreadLocalData::dirty_card_queue_index_offset()));
+  llvm::Value* buffer_offset = llvm::ConstantInt::get(intptr_type, in_bytes(G1ThreadLocalData::dirty_card_queue_buffer_offset()));
+
+  // Pointers into the thread
+  llvm::Value* buffer_adr  = ir_builder.CreateInBoundsGEP(no_base, tls, buffer_offset);
+  llvm::Value* index_adr   = ir_builder.CreateInBoundsGEP(no_base, tls, index_offset);
+
+  // Now some values
+  llvm::Value* index = ir_builder.CreateLoad(intptr_type, index_adr);
+  llvm::Value* buffer = ir_builder.CreateIntToPtr(ir_builder.CreateLoad(intptr_type, buffer_adr),
+                                                  llvm::PointerType::get(context, llvm::jeandle::AddrSpace::CHeapAddrSpace));
+
+  // Find the card table address.
+  llvm::Value* obj_ptr = ir_builder.CreatePtrToInt(obj_addr, intptr_type);
+  llvm::Value* card_offset = ir_builder.CreateLShr(obj_ptr, llvm::ConstantInt::get(intptr_type, CardTable::card_shift()));
+  llvm::Value* card_base_addr = ir_builder.CreateIntToPtr(llvm::ConstantInt::get(intptr_type, (uint64_t)ci_card_table_address()),
+                                                    llvm::PointerType::get(context, llvm::jeandle::AddrSpace::CHeapAddrSpace));
+  llvm::Value* card_adr = ir_builder.CreateInBoundsGEP(no_base, card_base_addr, card_offset);
+
+  // Should be able to do an unsigned compare of region_size instead of
+  // and extra shift. Do we have an unsigned compare??
+  llvm::Value* val_ptr = ir_builder.CreatePtrToInt(value, intptr_type);
+  llvm::Value* xor_res = ir_builder.CreateLShr(ir_builder.CreateXor(obj_ptr, val_ptr), 
+                                               llvm::ConstantInt::get(intptr_type, (uint64_t)HeapRegion::LogOfHRGrainBytes));
+
+  // if (xor_res == 0) same region so skip
+  llvm::BasicBlock* post_barrier_done  = llvm::BasicBlock::Create(context, "post_barrier_done", func);
+  llvm::BasicBlock* filter_same_region = llvm::BasicBlock::Create(context, "filter_same_region", func);
+  llvm::Value* same_region = ir_builder.CreateICmp(llvm::CmpInst::ICMP_EQ, xor_res, zeroX);
+  ir_builder.CreateCondBr(same_region, post_barrier_done, filter_same_region);
+    
+  ir_builder.SetInsertPoint(filter_same_region);
+    
+  // No barrier if we are storing a null.
+  llvm::BasicBlock* filter_val_nullptr = llvm::BasicBlock::Create(context, "filter_val_nullptr", func);
+  llvm::Value* val_is_null = ir_builder.CreateIsNull(value);
+  ir_builder.CreateCondBr(val_is_null, post_barrier_done, filter_val_nullptr);
+
+  ir_builder.SetInsertPoint(filter_val_nullptr);
+
+  // Ok must mark the card if not already dirty
+
+  // load the original value of the card
+  llvm::LoadInst* card_value = ir_builder.CreateLoad(ir_builder.getInt8Ty(), card_adr);
+  card_value->setAtomic(llvm::AtomicOrdering::Unordered); 
+
+  llvm::BasicBlock* filter_young_card = llvm::BasicBlock::Create(context, "filter_young_card", func);
+  llvm::Value* card_is_young = ir_builder.CreateICmp(llvm::CmpInst::ICMP_EQ, card_value, young_card);
+  ir_builder.CreateCondBr(card_is_young, post_barrier_done, filter_young_card);
+
+  ir_builder.SetInsertPoint(filter_young_card);
+
+  ir_builder.CreateFence(llvm::AtomicOrdering::AcquireRelease);
+
+  llvm::LoadInst* card_val_reload = ir_builder.CreateLoad(ir_builder.getInt8Ty(), card_adr);
+  card_val_reload->setAtomic(llvm::AtomicOrdering::Unordered); 
+  llvm::BasicBlock* store_dirty_block = llvm::BasicBlock::Create(context, "store_dirty_block", func);
+  llvm::Value* card_is_dirty = ir_builder.CreateICmp(llvm::CmpInst::ICMP_EQ, card_val_reload, dirty_card);
+  ir_builder.CreateCondBr(card_is_dirty, post_barrier_done, store_dirty_block);
+
+  ir_builder.SetInsertPoint(store_dirty_block);
+
+  // g1_mark_card
+
+  // Smash zero into card. MUST BE ORDERED WRT TO STORE
+  llvm::StoreInst* dirty_store = ir_builder.CreateStore(zero, card_adr);
+  dirty_store->setAtomic(llvm::AtomicOrdering::Release);
+
+  // Now do the queue work
+  llvm::BasicBlock* buffer_is_full  = llvm::BasicBlock::Create(context, "buffer_is_full", func);
+  llvm::BasicBlock* store_in_buffer = llvm::BasicBlock::Create(context, "store_in_buffer", func);
+  llvm::Value* index_is_zero = ir_builder.CreateICmp(llvm::CmpInst::ICMP_EQ, index, zeroX);
+  ir_builder.CreateCondBr(index_is_zero, buffer_is_full, store_in_buffer);
+
+  ir_builder.SetInsertPoint(store_in_buffer);
+
+  // decrement the index
+  llvm::Value* next_index = ir_builder.CreateSub(index, llvm::ConstantInt::get(intptr_type, sizeof(intptr_t)));
+  llvm::Value* log_addr = ir_builder.CreateInBoundsGEP(no_base, buffer, next_index);
+
+  llvm::StoreInst* store_value = ir_builder.CreateStore(card_adr, log_addr);
+  store_value->setAtomic(llvm::AtomicOrdering::Unordered);
+  llvm::StoreInst* store_index = ir_builder.CreateStore(next_index, index_adr);
+  store_index->setAlignment(llvm::Align(8)); 
+  store_index->setAtomic(llvm::AtomicOrdering::Unordered);
+
+  ir_builder.CreateBr(post_barrier_done);
+
+  ir_builder.SetInsertPoint(buffer_is_full);
+
+  llvm::FunctionCallee postbarrier_callee = JeandleRuntimeRoutine::G1BarrierSetRuntime_write_ref_field_post_entry_callee(template_module);
+  if (!postbarrier_callee) {
+    RuntimeDefinedJavaOps::set_failed("JeandleRuntimeRoutine::G1BarrierSetRuntime_write_ref_field_post_entry_callee is not found");
+    return;
+  }
+  llvm::CallInst* call_inst = ir_builder.CreateCall(postbarrier_callee, {card_adr, tls});
+  call_inst->setCallingConv(llvm::CallingConv::C);
+
+  ir_builder.CreateBr(post_barrier_done);
+
+  ir_builder.SetInsertPoint(post_barrier_done);
+  ir_builder.CreateRetVoid();
+JAVA_OP_END
+
+DEF_JAVA_OP(pre_barrier, 1, llvm::Type::getVoidTy(context), llvm::PointerType::get(context, llvm::jeandle::AddrSpace::JavaHeapAddrSpace))
+  if (UseG1GC) {
+    llvm::Function* g1_pre_barrier_func = template_module.getFunction("jeandle.g1_pre_barrier");
+    assert(g1_pre_barrier_func != nullptr, "g1_pre_barrier function not found");
+    llvm::CallInst* call_inst = ir_builder.CreateCall(g1_pre_barrier_func, {func->getArg(0)});
+    call_inst->setCallingConv(llvm::CallingConv::Hotspot_JIT);
+  }
+  ir_builder.CreateRetVoid();
+JAVA_OP_END
+
+DEF_JAVA_OP(post_barrier, 1, llvm::Type::getVoidTy(context), 
+            llvm::PointerType::get(context, llvm::jeandle::AddrSpace::JavaHeapAddrSpace),
+            llvm::PointerType::get(context, llvm::jeandle::AddrSpace::JavaHeapAddrSpace))
+  if (UseG1GC) {
+    llvm::Function* g1_post_barrier_func = template_module.getFunction("jeandle.g1_post_barrier");
+    assert(g1_post_barrier_func != nullptr, "g1_post_barrier function not found");
+    llvm::CallInst* call_inst = ir_builder.CreateCall(g1_post_barrier_func, {func->getArg(0), func->getArg(1)});
+    call_inst->setCallingConv(llvm::CallingConv::Hotspot_JIT);
+  } else {
+    llvm::Function* card_table_barrier_func = template_module.getFunction("jeandle.card_table_barrier");
+    assert(card_table_barrier_func != nullptr, "card_table_barrier function not found");
+    llvm::CallInst* call_inst = ir_builder.CreateCall(card_table_barrier_func, {func->getArg(0)});
+    call_inst->setCallingConv(llvm::CallingConv::Hotspot_JIT);
+  }
+  ir_builder.CreateRetVoid();
+JAVA_OP_END
+
 DEF_JAVA_OP(new_instance, 1, llvm::PointerType::get(context, llvm::jeandle::AddrSpace::JavaHeapAddrSpace),
             llvm::PointerType::get(context, llvm::jeandle::AddrSpace::CHeapAddrSpace), // klass
             llvm::Type::getInt32Ty(context)) // size_in_bytes
@@ -187,6 +447,10 @@ bool RuntimeDefinedJavaOps::define_all(llvm::Module& template_module) {
   define_current_thread(template_module);
   define_safepoint_poll(template_module);
   define_card_table_barrier(template_module);
+  define_g1_pre_barrier(template_module);
+  define_g1_post_barrier(template_module);
+  define_pre_barrier(template_module);
+  define_post_barrier(template_module);
   define_new_instance(template_module);
 
   return failed();

@@ -35,6 +35,7 @@
 #include "ci/ciMethodBlocks.hpp"
 #include "ci/ciSymbols.hpp"
 #include "classfile/javaClasses.hpp"
+#include "gc/shared/gc_globals.hpp"
 #include "logging/log.hpp"
 #include "runtime/sharedRuntime.hpp"
 #include "runtime/stubRoutines.hpp"
@@ -2141,6 +2142,11 @@ void JeandleAbstractInterpreter::do_array_load(BasicType basic_type) {
 
 void JeandleAbstractInterpreter::do_array_store_inner(BasicType basic_type, llvm::Type* store_type, llvm::Value* value) {
   llvm::Value* element_address = compute_array_element_address(basic_type, store_type);
+  
+  if (UseG1GC && basic_type == T_OBJECT) {
+    call_java_op("jeandle.g1_pre_barrier", {element_address});
+  }
+  
   llvm::StoreInst* store_inst = _ir_builder.CreateStore(value, element_address);
   store_inst->setAtomic(llvm::AtomicOrdering::Unordered);
 
@@ -2148,7 +2154,7 @@ void JeandleAbstractInterpreter::do_array_store_inner(BasicType basic_type, llvm
   // Currently, we can't get array type in LLVM pass. Once a clearer design is available, the barrier
   // insertion operation will be moved to the LLVM pass.
   if (basic_type == T_OBJECT) {
-    call_java_op("jeandle.card_table_barrier", {element_address});
+    call_java_op("jeandle.post_barrier", {element_address, value});
   }
 }
 

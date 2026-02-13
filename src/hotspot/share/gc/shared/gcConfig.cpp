@@ -145,11 +145,12 @@ GCArguments* GCConfig::select_gc() {
 
   if (UseJeandleCompiler) {
     FOR_EACH_INCLUDED_GC(gc) {
-      if (gc->_name == CollectedHeap::Serial) {
-        gc->_flag = true;
-      } else if (gc->_flag) {
-        warning("Only serial GC is supported on jeandle for now. It will be enabled by default until jeandle supports other GCs.");
-        gc->_flag = false;
+      if (gc->_flag) {
+        if (gc->_name != CollectedHeap::Serial && gc->_name != CollectedHeap::G1) {
+          warning("Only serial/G1 GC is supported on jeandle for now. G1 will be enabled by default until jeandle supports other GCs.");
+          gc->_flag = false;
+          FLAG_SET_ERGO(UseG1GC, true);
+        }
       }
     }
   }
